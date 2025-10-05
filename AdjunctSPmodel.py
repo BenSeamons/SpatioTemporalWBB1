@@ -2,6 +2,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from multiprocessing import Pool, cpu_count
+from functools import partial
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
 import pandas as pd
@@ -219,6 +220,9 @@ for i in range(N):
     if INIT_PLT > 0:
         plt_queues[i].append([0.0, INIT_PLT])
 
+# Controls whether step() logs per-timestep telemetry into the global arrays.
+collect_live_metrics = True
+
 # ✅ FIX: Moved this section up
 B_init = {
     "RBC": np.full(N, INIT_RBC, dtype=float),
@@ -232,9 +236,10 @@ NR_init = np.full(N, N_total, dtype=float)
 NU_init = np.zeros(N, dtype=float)
 
 
-def step(t, B, NR, NU, cumulative_wbb_generated, casualty_rate=7.5):
+def step(t, B, NR, NU, cumulative_wbb_generated, casualty_rate=7.5, wbb_rate=None):
     global last_redistribution_check, nu_queues
     t_prev = t - dt
+    donor_rate = WBB_RATE if wbb_rate is None else wbb_rate
 
     # --- periodic redistribution planning ---
     if t - last_redistribution_check >= redistribution_check_interval:
@@ -398,7 +403,7 @@ def step(t, B, NR, NU, cumulative_wbb_generated, casualty_rate=7.5):
 
         # --- collect WBB donations if gate allows ---
         if allow_wbb_donation and t > t_setup[i] and NR[i] > 0 and B["WBB"][i] < B_max:
-            max_draw = min(WBB_RATE * dt, NR[i], B_max - B["WBB"][i])
+            max_draw = min(donor_rate * dt, NR[i], B_max - B["WBB"][i])
             if max_draw > 0:
                 wbb_queues[i].append([0.0, max_draw])
                 NR[i] -= max_draw
@@ -452,19 +457,27 @@ def step(t, B, NR, NU, cumulative_wbb_generated, casualty_rate=7.5):
     # --- logs, low-supply, overwhelmed ---
     t_idx = int(t / dt)
     for i in range(N):
-        live_WBB[i, t_idx] = sum(q for _, q in wbb_queues[i])
-        live_PLT[i, t_idx] = sum(q for _, q in plt_queues[i])
-        live_CAS[i, t_idx] = B["CAS"][i]
+        cur_wbb = sum(q for _, q in wbb_queues[i])
+        cur_plt = sum(q for _, q in plt_queues[i])
+
+        if collect_live_metrics:
+            live_WBB[i, t_idx] = cur_wbb
+            live_PLT[i, t_idx] = cur_plt
+            live_CAS[i, t_idx] = B["CAS"][i]
+
         for k in INIT_STOCK:
-            if k == "CAS": continue
-            if k in ("WBB","PLT"):
-                cur = sum(q for _, q in (wbb_queues[i] if k == "WBB" else plt_queues[i]))
-                if cur < THRESHOLD_FRACTION * INIT_STOCK[k]:
-                    low_supply_events[k][i].append(t)
+            if k == "CAS":
+                continue
+            if k == "WBB":
+                cur = cur_wbb
+            elif k == "PLT":
+                cur = cur_plt
             else:
-                if B[k][i] < THRESHOLD_FRACTION * INIT_STOCK[k]:
-                    low_supply_events[k][i].append(t)
-        if (t > t_setup[i] and NR[i] > 0 and live_WBB[i, t_idx] < 1.0):
+                cur = B[k][i]
+            if cur < THRESHOLD_FRACTION * INIT_STOCK[k]:
+                low_supply_events[k][i].append(t)
+
+        if (t > t_setup[i] and NR[i] > 0 and cur_wbb < 1.0):
             wbb_overwhelmed_events[i].append(t)
 
     # --- clamp negatives (defensive) ---
@@ -515,16 +528,14 @@ for idx, t in enumerate(time):
 # Plotting
 # ...
 
-def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
+def run_sim_with_interval(interval_hours, casualty_rate=7.5, wbb_rate=None, collect_timeseries=True):
     global B_state, NR_state, NU_state, wbb_queues, plt_queues, redistribution_events, last_redistribution_check
-    global unmet_demand_log, live_WBB, live_PLT, live_CAS, resupply_schedule, blackout_windows, nu_queues
+    global unmet_demand_log, live_WBB, live_PLT, live_CAS, resupply_schedule, blackout_windows, nu_queues, collect_live_metrics
     global FWB_from_WIA, FWB_from_DD
     FWB_from_WIA = np.zeros(N)
     FWB_from_DD  = np.zeros(N)
 
-
-    if wbb_rate is not None:
-        WBB_RATE=wbb_rate
+    collect_live_metrics = collect_timeseries
 
     # Reset everything
     B_state = {k: B_init[k].copy() for k in B_init}
@@ -535,9 +546,12 @@ def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
     nu_queues = [[] for _ in range(N)]
     cumulative_wbb_generated = np.zeros(N)
     # re-init live telemetry for this run
-    live_WBB = np.zeros((N, len(time)))
-    live_PLT = np.zeros((N, len(time)))
-    live_CAS = np.zeros((N, len(time)))
+    if collect_timeseries:
+        live_WBB = np.zeros((N, len(time)))
+        live_PLT = np.zeros((N, len(time)))
+        live_CAS = np.zeros((N, len(time)))
+    else:
+        live_WBB = live_PLT = live_CAS = None
 
 
     for i in range(N):
@@ -552,8 +566,10 @@ def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
     unmet_demand_log.fill(0)
 
     # Initialize per-product time-series results for this run
-    results_ts = {k: np.zeros((N, len(time))) for k in ["RBC", "FFP", "PLT", "CRYO", "WBB", "CAS"]}
-    results_ts["cumulative_wbb_generated"] = np.zeros((N, len(time)))
+    results_ts = None
+    if collect_timeseries:
+        results_ts = {k: np.zeros((N, len(time))) for k in ["RBC", "FFP", "PLT", "CRYO", "WBB", "CAS"]}
+        results_ts["cumulative_wbb_generated"] = np.zeros((N, len(time)))
 
     blackout_windows = []
     t = 0
@@ -577,12 +593,21 @@ def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
             t += interval_hours
 
     for idx, t in enumerate(time):
-        casualties, cumulative_wbb_generated = step(t, B_state, NR_state, NU_state, cumulative_wbb_generated, casualty_rate=casualty_rate)
+        casualties, cumulative_wbb_generated = step(
+            t,
+            B_state,
+            NR_state,
+            NU_state,
+            cumulative_wbb_generated,
+            casualty_rate=casualty_rate,
+            wbb_rate=wbb_rate,
+        )
 
-        for k in ["RBC", "FFP", "PLT", "CRYO", "CAS"]:
-            results_ts[k][:, idx] = B_state[k]
-        results_ts["WBB"][:, idx] = [sum(qty for age, qty in wbb_queues[i]) for i in range(N)]
-        results_ts["cumulative_wbb_generated"][:, idx] = cumulative_wbb_generated.copy()
+        if collect_timeseries:
+            for k in ["RBC", "FFP", "PLT", "CRYO", "CAS"]:
+                results_ts[k][:, idx] = B_state[k]
+            results_ts["WBB"][:, idx] = [sum(qty for age, qty in wbb_queues[i]) for i in range(N)]
+            results_ts["cumulative_wbb_generated"][:, idx] = cumulative_wbb_generated.copy()
 
     total_unmet = np.sum(unmet_demand_log)
     first_failure_time = None
@@ -594,7 +619,7 @@ def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
     total_FWB_from_DD  = np.sum(FWB_from_DD)
     total_FWB_from_WIA = np.sum(FWB_from_WIA)
 
-    return {
+    summary = {
         "interval": interval_hours,
         "total_unmet": total_unmet,
         "first_failure_time": first_failure_time,
@@ -602,17 +627,23 @@ def run_sim_with_interval(interval_hours, casualty_rate=7.5,wbb_rate=None):
         "final_WBB": np.mean(B_state["WBB"]),
         "casualties_total": np.sum(B_state["CAS"]),
         "unmet_by_node": [int(np.sum(unmet_demand_log[i])) for i in range(N)],
-        "unmet_over_time": unmet_demand_log.copy(),
-        "RBC": results_ts["RBC"],
-        "FFP": results_ts["FFP"],
-        "PLT": results_ts["PLT"],
-        "CRYO": results_ts["CRYO"],
-        "WBB": results_ts["WBB"],
-        "CAS": results_ts["CAS"],
-        "cumulative_wbb_generated": results_ts["cumulative_wbb_generated"],
+        "unmet_over_time": unmet_demand_log.copy() if collect_timeseries else None,
         "FWB_from_DD": total_FWB_from_DD,
-        "FWB_from_WIA": total_FWB_from_WIA
+        "FWB_from_WIA": total_FWB_from_WIA,
     }
+
+    if collect_timeseries and results_ts is not None:
+        summary.update({
+            "RBC": results_ts["RBC"],
+            "FFP": results_ts["FFP"],
+            "PLT": results_ts["PLT"],
+            "CRYO": results_ts["CRYO"],
+            "WBB": results_ts["WBB"],
+            "CAS": results_ts["CAS"],
+            "cumulative_wbb_generated": results_ts["cumulative_wbb_generated"],
+        })
+
+    return summary
 
 
 def plot_full_blood_panel(sim_result, interval, wbb_rate_avg=10):
@@ -683,10 +714,11 @@ def run_stress_test(intervals=[24,48,72,96,120], num_runs=50):
     print("-" * 65)
 
     for iv in intervals:
-        args=[iv]*num_runs
+        args = [iv] * num_runs
 
+        worker = partial(run_sim_with_interval, collect_timeseries=False)
         with Pool(cpu_count()) as pool:
-            outs = pool.map(run_sim_with_interval, args)
+            outs = pool.map(worker, args)
 
         for out in outs:
             samples_unmet[iv].append(out['total_unmet'])
@@ -720,8 +752,9 @@ def run_donor_stress_test(rates=[10,8,6,4], num_runs=50):
     for r in rates:
         WBB_RATE = r
         args = [60]*num_runs
+        worker = partial(run_sim_with_interval, collect_timeseries=False)
         with Pool(cpu_count()) as pool:
-                outs = pool.map(run_sim_with_interval, args)
+            outs = pool.map(worker, args)
 
         for out in outs:
             samples_unmet[r].append(out['total_unmet'])
@@ -732,7 +765,8 @@ def run_donor_stress_test(rates=[10,8,6,4], num_runs=50):
         avg_ff = float(np.mean(samples_first_fail[r])) if samples_first_fail[r] else None
         print(f"{r:>15} | {avg_unmet:>18.2f} | {avg_ff or 'None':>23}")
 
-        plot_full_blood_panel(out,60,r)
+        detailed_run = run_sim_with_interval(60, wbb_rate=r, collect_timeseries=True)
+        plot_full_blood_panel(detailed_run, 60, r)
 
     WBB_RATE = original
     return {"unmet": samples_unmet, "first_fail": samples_first_fail}
@@ -747,10 +781,11 @@ def run_casualty_stress_test(rates=[2,3,4,5,6,7], num_runs=50):
     print("-" * 65)
 
     for r in rates:
-        args = [(24,r)]*num_runs
+        args = [(24, r)] * num_runs
+        worker = partial(run_sim_with_interval, collect_timeseries=False)
 
         with Pool(cpu_count()) as pool:
-            outs = pool.starmap(run_sim_with_interval, args)
+            outs = pool.starmap(worker, args)
         for out in outs:
             samples_unmet[r].append(out['total_unmet'])
             if out['first_failure_time'] is not None and np.isfinite(out['first_failure_time']):
@@ -786,7 +821,8 @@ def _run_cell(args):
     resupply, wbb, cas, num_runs, metric = args
     #global WBB_RATE
     #WBB_RATE = wbb  # override global donor rate
-    outs = [run_sim_with_interval(resupply, casualty_rate=cas,wbb_rate=wbb) for _ in range(num_runs)]
+    outs = [run_sim_with_interval(resupply, casualty_rate=cas, wbb_rate=wbb, collect_timeseries=False)
+            for _ in range(num_runs)]
     return np.mean([o[metric] for o in outs])
 
 def heatmap_casualty_wbb_parallel(resupply_interval=48, casualty_rates=[2,3,4,5,6,7],
@@ -826,7 +862,8 @@ def heatmap_wbb_vs_resupply(casualty_rate, wbb_rates, resupply_intervals, num_ru
 
     for i, wbb in enumerate(wbb_rates):
         for j, resupply in enumerate(resupply_intervals):
-            outs = [run_sim_with_interval(resupply, casualty_rate=casualty_rate, wbb_rate=wbb)
+            outs = [run_sim_with_interval(resupply, casualty_rate=casualty_rate, wbb_rate=wbb,
+                                          collect_timeseries=False)
                     for _ in range(num_runs)]
             results[i, j] = np.mean([o[metric] for o in outs])
 
@@ -858,7 +895,8 @@ def collect_data(resupply_intervals, wbb_rates, casualty_rates,kia_suitable_leve
                         for _ in range(num_runs):
                             out = run_sim_with_interval(interval_hours=res,
                                                         casualty_rate=cas,
-                                                        wbb_rate=wbb)
+                                                        wbb_rate=wbb,
+                                                        collect_timeseries=False)
                             rows.append({
                                 "casualties_per_day": cas * 24,
                                 "casualties_per_hr": cas,
